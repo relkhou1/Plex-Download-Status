@@ -4,6 +4,8 @@ from dotenv import load_dotenv
 import requests
 from discord.ext import commands
 import random
+import re
+import asyncio
 
 load_dotenv()
 
@@ -73,32 +75,86 @@ async def on_ready():
     print(f'Logged in as {bot.user} (ID: {bot.user.id})')
     print('------')
 
-async def display_transfers(embeds, ctx):
-	await ctx.send(embeds=embeds)
+REFRESH_INTERVAL_SECONDS = 10
 
-def embed(name, status, message, progress):
-    title = name
-    e = discord.Embed(title=f"{title}", color=0x98FFE4 if status == "finished" else 0xF7F4A6)
+# "2,024.00 KB/s from 4 peers, 263.1 MB of 4.9 GB, 39 mins left"
+MESSAGE_PATTERN = re.compile(
+	r"^(?P<speed>[\d.,]+\s*[A-Za-z]+/s) from (?P<peers>\d+) peers?, "
+	r"(?P<downloaded>[\d.]+\s*[A-Za-z]+) of (?P<total>[\d.]+\s*[A-Za-z]+), "
+	r"(?P<time_left>.+)$"
+)
+
+def parse_message(status, message):
+	if status == "finished" or not message:
+		return {"state": "finished"}
+	if message.strip() == "Loading...":
+		return {"state": "starting"}
+
+	match = MESSAGE_PATTERN.match(message)
+	if not match:
+		return {"state": "unknown", "raw": message}
+
+	fields = match.groupdict()
+	fields["state"] = "downloading"
+	fields["percent"] = size_to_bytes(fields["downloaded"]) / size_to_bytes(fields["total"])
+	return fields
+
+SIZE_UNITS = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}
+
+def size_to_bytes(size_str):
+	value, unit = size_str.split()
+	return float(value) * SIZE_UNITS[unit.upper()]
+
+def progress_bar(percent, length=20):
+	percent = max(0.0, min(1.0, percent))
+	filled = round(length * percent)
+	bar = "█" * filled + "░" * (length - filled)
+	return f"`{bar}` {percent * 100:.1f}%"
+
+async def display_transfers(embeds, ctx):
+	return await ctx.send(embeds=embeds)
+
+def embed(name, status, message):
+    e = discord.Embed(title=f"{name}", color=0x98FFE4 if status == "finished" else 0xF7F4A6)
     e.add_field(name="Status", value=status, inline=True)
-    e.add_field(name="Progress", value=f"{progress}*100:.1f%", inline=True)
-    if message:
-        e.set_footer(text=message)
+
+    parsed = parse_message(status, message)
+    if parsed["state"] == "starting":
+        e.add_field(name="Network", value="Connecting...", inline=True)
+    elif parsed["state"] == "downloading":
+        e.add_field(name="Network", value=f"{parsed['peers']} peers", inline=True)
+        e.add_field(name="Peak", value=parsed['speed'], inline=True)
+        e.add_field(name="Time Left", value=parsed['time_left'], inline=True)
+        e.add_field(
+            name="Progress",
+            value=f"{progress_bar(parsed['percent'])}\n{parsed['downloaded']} of {parsed['total']}",
+            inline=False,
+        )
+    elif parsed["state"] == "unknown":
+        e.set_footer(text=parsed["raw"])
+
     return e
 
-async def handle_transfers(transfers, ctx):
-	transfers = is_data(transfers)
-	if not transfers:
+def build_embeds(transfers_data):
+	return [embed(t['name'], t['status'], t['message']) for t in transfers_data]
+
+async def handle_transfers(transfers, ctx, fetch=None):
+	data = is_data(transfers)
+	if not data:
 		return
-	# Get name, status, message
-	embeds = []
-	for t in transfers:
-		name = t['name']
-		status = t['status']
-		message = t['message']
-		progress = t['progress']
-		embeds.append(embed(name, status, message, progress))
-	
-	await display_transfers(embeds, ctx)
+
+	sent = await display_transfers(build_embeds(data), ctx)
+
+	if fetch is None:
+		return
+
+	while any(t['status'] != "finished" for t in data):
+		await asyncio.sleep(REFRESH_INTERVAL_SECONDS)
+		transfers = fetch()
+		data = is_data(transfers)
+		if not data:
+			break
+		await sent.edit(embeds=build_embeds(data))
 
 def speed_cleaned(speed, total_size):
 	pass
@@ -144,23 +200,90 @@ async def handle_downloads(downloads, ctx):
 
 	return downloads
 
+def format_size(num_bytes):
+	if num_bytes >= SIZE_UNITS["GB"]:
+		return f"{num_bytes / SIZE_UNITS['GB']:.1f} GB"
+	return f"{num_bytes / SIZE_UNITS['MB']:.1f} MB"
+
+# Two synthetic in-progress downloads, each with its own size/speed, so
+# repeated get_transfers() calls show their progress bars climbing to 100%.
+SIM_JOBS = [
+	{
+		"id": "w0yHQIzBFu_dFw1yjo1kbQ",
+		"name": "Monsoon Wedding (2001) Criterion (1080p BluRay x265 HEVC 10bit AAC 5.1 Tigole) [QxR]",
+		"total_bytes": 7.3 * SIZE_UNITS["GB"],
+		"downloaded_bytes": 0,
+		"speed_kbps": (2800, 3600),
+		"peers": (3, 6),
+	},
+	{
+		"id": "HxRjjVcpqe2Bx-Abq8OqHw",
+		"name": "Lolita.(1962).ITA-ENG.Ac3.2.0.multisub.BDRip.1080p.X264-BaMax71-iDN_CreW",
+		"total_bytes": 4.9 * SIZE_UNITS["GB"],
+		"downloaded_bytes": 263.1 * SIZE_UNITS["MB"],
+		"speed_kbps": (1800, 2200),
+		"peers": (2, 5),
+	},
+]
+
+def get_transfers():
+	# TODO: swap for call_api(transfer_url) once the API is reachable for testing
+	jobs = [{
+		"id": "jf0a3CaGkY2vNLqo3C12wQ",
+		"name": "Monsoon Wedding 2001 Criterion 1080p BluRay HEVC x265 5.1 BONE.mkv",
+		"message": "",
+		"status": "finished",
+		"progress": 0,
+		"src": "https://www.premiumize.me/api/job/src?id=jf0a3CaGkY2vNLqo3C12wQ",
+		"folder_id": "",
+		"file_id": "2O4R9DVP6LYTiPmQkl6Efg",
+	}]
+
+	for job in SIM_JOBS:
+		if job["downloaded_bytes"] <= 0:
+			# First poll after the job appears: still connecting to peers.
+			job["downloaded_bytes"] = 1
+			message = "Loading..."
+		elif job["downloaded_bytes"] >= job["total_bytes"]:
+			message = ""
+		else:
+			speed_kbps = random.uniform(*job["speed_kbps"])
+			job["downloaded_bytes"] = min(
+				job["total_bytes"],
+				job["downloaded_bytes"] + speed_kbps * 1024 * REFRESH_INTERVAL_SECONDS,
+			)
+			remaining_bytes = job["total_bytes"] - job["downloaded_bytes"]
+			minutes_left = max(1, round(remaining_bytes / (speed_kbps * 1024) / 60))
+			peers = random.randint(*job["peers"])
+			message = (
+				f"{speed_kbps:,.2f} KB/s from {peers} peers, "
+				f"{format_size(job['downloaded_bytes'])} of {format_size(job['total_bytes'])}, "
+				f"{minutes_left} mins left"
+			)
+
+		finished = job["downloaded_bytes"] >= job["total_bytes"]
+		jobs.append({
+			"id": job["id"],
+			"name": job["name"],
+			"message": message,
+			"status": "finished" if finished else "running",
+			# The real API reports 0 once a job is finished, matching the sample payload.
+			"progress": 0 if finished else job["downloaded_bytes"] / job["total_bytes"],
+			"src": f"https://www.premiumize.me/api/job/src?id={job['id']}",
+			"folder_id": "",
+			"file_id": "",
+		})
+
+	return {"data": jobs, "status": ""}
+
 @bot.command()
 async def status(ctx):
     # Call the sonarr api
     # If downloading, return the percentage and what it's downloading
     ### if "totalRecords" > 0, then return how long it'll take to download everyhting
-#	transfers = call_api(transfer_url)
 #	downloads = call_api(download_url)
 
-	transfers = {"data":
-			  [
-	{"id":"jf0a3CaGkY2vNLqo3C12wQ","name":"Monsoon Wedding 2001 Criterion 1080p BluRay HEVC x265 5.1 BONE.mkv","message":"","status":"finished","progress":0,"src":"https://www.premiumize.me/api/job/src?id=jf0a3CaGkY2vNLqo3C12wQ","folder_id":"","file_id":"2O4R9DVP6LYTiPmQkl6Efg"},
-	{"id":"w0yHQIzBFu_dFw1yjo1kbQ","name":"Monsoon Wedding (2001) Criterion (1080p BluRay x265 HEVC 10bit AAC 5.1 Tigole) [QxR]","message":"Loading...","status":"running","progress":0,"src":"https://www.premiumize.me/api/job/src?id=w0yHQIzBFu_dFw1yjo1kbQ","folder_id":"","file_id":""},
-	{"id":"HxRjjVcpqe2Bx-Abq8OqHw","name":"Lolita.(1962).ITA-ENG.Ac3.2.0.multisub.BDRip.1080p.X264-BaMax71-iDN_CreW","message":"2,024.00 KB/s from 4 peers, 263.1 MB of 4.9 GB, 39 mins left","status":"running","progress":0.052692342549562454,"src":"https://www.premiumize.me/api/job/src?id=HxRjjVcpqe2Bx-Abq8OqHw","folder_id":"","file_id":""}
-	],
-	"status":""
-	}
-	await handle_transfers(transfers, ctx)
+	await handle_transfers(get_transfers(), ctx, fetch=get_transfers)
 #	handle_downloads(downloads, ctx)
 
 
