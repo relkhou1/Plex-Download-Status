@@ -1,0 +1,8 @@
+services:
+  notifiarr:
+    build: .
+    container_name: notifiarr
+    env_file:
+      - .env
+    restart: unless-stopped
+    network_mode: host
